@@ -55,6 +55,7 @@ class Metric(object):
     self.ignore = False
     self.timezone = "PDT"
     self.options = None
+    self.henry='HENRY'
     self.sub_metrics = None   #users can specify what sub_metrics to process/plot;
     for (key, val) in rule_strings.iteritems():
       naarad.utils.set_sla(self, self.label, key, val)
