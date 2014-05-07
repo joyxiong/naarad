@@ -14,6 +14,7 @@ from naarad.graphing.plot_data import PlotData as PD
 import naarad.utils
 import naarad.httpdownload
 import naarad.naarad_constants as CONSTANTS
+import datetime
 
 logger = logging.getLogger('naarad.metrics.metric')
 
@@ -57,6 +58,7 @@ class Metric(object):
     self.options = None
     self.sub_metrics = None   #users can specify what sub_metrics to process/plot;
     self.groupby = None
+    self.aggregation_granularity = 'second'
     for (key, val) in rule_strings.iteritems():
       naarad.utils.set_sla(self, self.label, key, val)
     if other_options:
@@ -162,12 +164,91 @@ class Metric(object):
       else:
         self.summary_stats[column][stat] = naarad.utils.normalize_float_for_display(self.calculated_stats[column][stat])
 
+  def get_aggregation_timestamp(self, timestamp, granularity='second'):
+    """
+    Return a timestamp from the raw epoch time based on the granularity preferences passed in.
+
+    :param string timestamp: raw epoch timestamp from the jmeter log line
+    :param string granularity: aggregation granularity used for plots.
+    :return: string aggregate_timestamp that will be used for metrics aggregation in all functions for JmeterMetric
+    """
+    #convert_to_unixts
+    if granularity == 'hour':
+      return datetime.datetime.utcfromtimestamp(naarad.utils.convert_to_unixts(timestamp) / 1000).strftime('%Y-%m-%d %H') + ':00:00', 3600
+    elif granularity == 'minute':
+      return datetime.datetime.utcfromtimestamp(naarad.utils.convert_to_unixts(timestamp) / 1000).strftime('%Y-%m-%d %H:%M') + ':00', 60
+    else:
+      return datetime.datetime.utcfromtimestamp(naarad.utils.convert_to_unixts(timestamp) / 1000).strftime('%Y-%m-%d %H:%M:%S'), 1
+
+  def aggregate_count_over_time(self, metric_store, groupby_name, aggregate_timestamp):
+    """
+    Organize and store the count of data from the log line into the metric store by metric type, transaction, timestamp
+
+    :param dict metric_store: The metric store used to store all the parsed jmeter log data
+    :param dict line_data: dict with the extracted k:v from the log line
+    :param list transaction_list: list of transaction to be used for storing the metrics from given line
+    :param string aggregate_timestamp: timestamp used for storing the raw data. This accounts for aggregation time period
+    :return: None
+    """
+    all_qps = metric_store['qps']
+    qps = all_qps[groupby_name]
+    if aggregate_timestamp in qps:
+      qps[aggregate_timestamp] += 1
+    else:
+      qps[aggregate_timestamp] = 1
+    return None
+
+  def aggregate_values_over_time(self, metric_store, data, groupby_name, column_name, aggregate_timestamp):
+    """
+    Organize and store the data from the log line into the metric store by metric type, transaction, timestamp
+
+    :param dict metric_store: The metric store used to store all the parsed jmeter log data
+    :param dict line_data: dict with the extracted k:v from the log line
+    :param list transaction_list: list of transaction to be used for storing the metrics from given line
+    :param list metric_list: list of metrics to extract from the log line
+    :param string aggregate_timestamp: timestamp used for storing the raw data. This accounts for aggregation time period
+    :return: None
+    """
+
+    metric_data = reduce(defaultdict.__getitem__, [column_name, groupby_name, aggregate_timestamp], metric_store)
+    metric_data.append(float(data))
+    return None
+
+  def average_values_for_plot(self, metric_store, data, averaging_factor):
+    """
+    Create the time series for the various metrics, averaged over the aggregation period being used for plots
+
+    :param dict metric_store: The metric store used to store all the parsed jmeter log data
+    :param dict data: Dict with all the metric data to be output to csv
+    :param float averaging_factor: averaging factor to be used for calculating the average per second metrics
+    :return: None
+    """
+    for column, groups_store in metric_store.items():
+      for group, time_store in groups_store.items():
+        for time_stamp, column_data in sorted(time_store.items()):
+          if column in ['qps']:
+            if self.groupby:
+              data[self.get_csv(column, group)].append(','.join([time_stamp, str(column_data/float(averaging_factor))]))
+            else:
+              data[self.get_csv(column)].append(','.join([time_stamp, str(column_data/float(averaging_factor))]))
+          else:
+            if self.groupby:
+              data[self.get_csv(column, group)].append(','.join([time_stamp, str(sum(map(float, column_data))/float(len(column_data)))]))
+            else:
+              data[self.get_csv(column)].append(','.join([time_stamp, str(sum(map(float, column_data))/float(len(column_data)))]))
+            #if column == 'by':
+            #  data[self.get_csv(group, 'thr')].append(','.join([time_stamp, str(sum(map(float, column_data))/float(averaging_factor * 1024 * 1024 / 8.0))]))
+          #elif column in ['qps', 'eqps']:
+          #  data[self.get_csv(column, group)].append(','.join([time_stamp, str(column_data/float(averaging_factor))]))
+    return None
+
   def parse(self):
-    qps = defaultdict(int)
+    processed_data = defaultdict(lambda : defaultdict(lambda : defaultdict(list)))
+    data = defaultdict(list)
     groupby_idxes = None
+    averaging_factor = None
     if self.groupby:
       groupby_idxes = self.get_groupby_indexes(self.groupby)
-    data = {}
     for input_file in self.infile_list:
       logger.info("Working on " + input_file)
       timestamp_format = None
@@ -192,7 +273,7 @@ class Metric(object):
           ts = naarad.utils.reconcile_timezones(ts, self.timezone, self.graph_timezone)
           if self.ts_out_of_range(ts):
             continue
-          qps[ts.split('.')[0]] += 1
+          #qps[ts.split('.')[0]] += 1
           if self.groupby:
             groupby_names = None
             for index in groupby_idxes:
@@ -200,27 +281,38 @@ class Metric(object):
                 groupby_names = words[index].rstrip(':')
               else:
                 groupby_names += '.' + words[index].rstrip(':')
+            aggregate_timestamp, averaging_factor = self.get_aggregation_timestamp(ts, self.aggregation_granularity)
+            self.aggregate_count_over_time(processed_data, groupby_names, aggregate_timestamp)
             for i in range(len(self.columns)):
               if i+1 in groupby_idxes:
                 continue
               else:
-                out_csv = self.get_csv(self.columns[i], groupby_names)
-                if out_csv in data:
-                  data[out_csv].append(ts + ',' + words[i+1])
-                else:
-                  data[out_csv] = []
-                  data[out_csv].append(ts + ',' + words[i+1])
+                self.aggregate_values_over_time(processed_data, words[i+1], self.columns[i], groupby_names, aggregate_timestamp)
+                #out_csv = self.get_csv(self.columns[i], groupby_names)
+                #if out_csv in data:
+                #  data[out_csv].append(ts + ',' + words[i+1])
+                #else:
+                #  data[out_csv] = []
+                #  data[out_csv].append(ts + ',' + words[i+1])
           else:
+            groupby_names = 'DEFAULT'
+            aggregate_timestamp, averaging_factor = self.get_aggregation_timestamp(ts, self.aggregation_granularity)
+            print 'JOY timestamp: ', aggregate_timestamp
+            self.aggregate_count_over_time(processed_data, groupby_names, aggregate_timestamp)
             for i in range(len(self.columns)):
-              out_csv = self.get_csv(self.columns[i])
-              if out_csv in data:
-                data[out_csv].append(ts + ',' + words[i+1])
-              else:
-                data[out_csv] = []
-                data[out_csv].append(ts + ',' + words[i+1])
+              self.aggregate_values_over_time(processed_data, words[i+1], self.columns[i], groupby_names, aggregate_timestamp)
+              #out_csv = self.get_csv(self.columns[i])
+              #if out_csv in data:
+              #  data[out_csv].append(ts + ',' + words[i+1])
+              #else:
+              #  data[out_csv] = []
+              #  data[out_csv].append(ts + ',' + words[i+1])
     # Post processing, putting data in csv files
-    data[self.get_csv('qps')] = map(lambda x: x[0] + ',' + str(x[1]), sorted(qps.items()))
+    #data[self.get_csv('qps')] = map(lambda x: x[0] + ',' + str(x[1]), sorted(qps.items()))
+    self.average_values_for_plot(processed_data, data, averaging_factor)
+    print 'JOY????????????????????', processed_data
     for csv in data.keys():
+      print 'JOY', csv
       self.csv_files.append(csv)
       with open(csv, 'w') as fh:
         fh.write('\n'.join(sorted(data[csv])))
