@@ -54,6 +54,8 @@ class JmeterMetric(Metric):
     self.aggregation_granularity = 'minute'
     self.calculated_percentiles = {}
     self.summary_stats = defaultdict(dict)
+    self.summary_html_content_enabled = True
+    self.summary_charts = [self.label + '.Overall_Summary.div']
     if not self.important_sub_metrics:
       self.important_sub_metrics = important_sub_metrics_import['JMETER']
     if other_options:
@@ -139,21 +141,6 @@ class JmeterMetric(Metric):
             data[self.get_csv(transaction, metric)].append(','.join([time_stamp, str(metric_data/float(averaging_factor))]))
     return None
 
-  def get_aggregation_timestamp(self, timestamp, granularity='minute'):
-    """
-    Return a timestamp from the raw epoch time based on the granularity preferences passed in.
-
-    :param string timestamp: raw epoch timestamp from the jmeter log line
-    :param string granularity: aggregation granularity used for plots.
-    :return: string aggregate_timestamp that will be used for metrics aggregation in all functions for JmeterMetric
-    """
-    if granularity == 'hour':
-      return datetime.datetime.utcfromtimestamp(int(timestamp) / 1000).strftime('%Y-%m-%d %H') + ':00:00', 3600
-    elif granularity == 'minute':
-      return datetime.datetime.utcfromtimestamp(int(timestamp) / 1000).strftime('%Y-%m-%d %H:%M') + ':00', 60
-    else:
-      return datetime.datetime.utcfromtimestamp(int(timestamp) / 1000).strftime('%Y-%m-%d %H:%M:%S'), 1
-
   def calculate_key_stats(self, metric_store):
     """
     Calculate key statistics for given data and store in the class variables calculated_stats and calculated_percentiles
@@ -226,12 +213,21 @@ class JmeterMetric(Metric):
     line_regex = re.compile(r' (lb|ts|t|by|s)="([^"]+)"')
     for input_file in self.infile_list:
       logger.info('Processing : %s', input_file)
+      timestamp_format = None
       with open(input_file) as infile:
         for line in infile:
           if '<httpSample' not in line and '<sample' not in line:
             continue
           line_data = dict(re.findall(line_regex, line))
-          aggregate_timestamp, averaging_factor = self.get_aggregation_timestamp(line_data['ts'], granularity)
+          if not timestamp_format or timestamp_format == 'unknown':
+            timestamp_format = naarad.utils.detect_timestamp_format(line_data['ts'])
+          if timestamp_format == 'unknown':
+            continue
+          ts = naarad.utils.get_standardized_timestamp(line_data['ts'], timestamp_format)
+          if ts == -1:
+            continue
+          ts = naarad.utils.reconcile_timezones(ts, self.timezone, self.graph_timezone)
+          aggregate_timestamp, averaging_factor = self.get_aggregation_timestamp(ts, granularity)
           self.aggregate_count_over_time(processed_data, line_data, [line_data['lb'], 'Overall_Summary'], aggregate_timestamp)
           self.aggregate_values_over_time(processed_data, line_data, [line_data['lb'], 'Overall_Summary'], ['t', 'by'], aggregate_timestamp)
         logger.info('Finished parsing : %s', input_file)
@@ -247,8 +243,8 @@ class JmeterMetric(Metric):
     return True
 
   def calculate_stats(self):
-    stats_csv = os.path.join(self.resource_directory, self.label + '.stats.csv')
-    imp_metric_stats_csv = os.path.join(self.resource_directory, self.label + '.important_sub_metrics.csv')
+    stats_csv = self.get_stats_csv()
+    imp_metric_stats_csv = self.get_important_sub_metrics_csv()
     csv_header = 'sub_metric,mean,std. deviation,median,min,max,90%,95%,99%\n'
     imp_csv_header = 'sub_metric,mean,std,p50,p75,p90,p95,p99,min,max\n'
     with open(stats_csv,'w') as FH:
@@ -256,7 +252,7 @@ class JmeterMetric(Metric):
       for sub_metric in self.calculated_stats:
         percentile_data = self.calculated_percentiles[sub_metric]
         stats_data = self.calculated_stats[sub_metric]
-        csv_data = ','.join([sub_metric,str(numpy.round_(stats_data['mean'], 2)),str(numpy.round_(stats_data['std'], 2)),str(numpy.round_(stats_data['median'], 2)),str(numpy.round_(stats_data['min'], 2)),str(numpy.round_(stats_data['max'], 2)),str(numpy.round_(percentile_data[90], 2)),str(numpy.round_(percentile_data[95], 2)),str(numpy.round_(percentile_data[99], 2))])
+        csv_data = ','.join([sub_metric,str(round(stats_data['mean'], 2)),str(round(stats_data['std'], 2)),str(round(stats_data['median'], 2)),str(round(stats_data['min'], 2)),str(round(stats_data['max'], 2)),str(round(percentile_data[90], 2)),str(round(percentile_data[95], 2)),str(round(percentile_data[99], 2))])
         FH.write(csv_data + '\n')
       self.stats_files.append(stats_csv)
     for sub_metric in self.calculated_percentiles:
@@ -272,20 +268,13 @@ class JmeterMetric(Metric):
         if sub_metric in self.calculated_stats.keys():
           percentile_data = self.calculated_percentiles[sub_metric]
           stats_data = self.calculated_stats[sub_metric]
-          csv_data = ','.join([sub_metric,str(numpy.round_(stats_data['mean'], 2)),str(numpy.round_(stats_data['std'], 2)),str(numpy.round_(stats_data['median'], 2)),str(numpy.round_(stats_data['min'], 2)),str(numpy.round_(stats_data['max'], 2)),str(numpy.round_(percentile_data[90], 2)),str(numpy.round_(percentile_data[95], 2)),str(numpy.round_(percentile_data[99], 2))])
+          csv_data = ','.join([sub_metric,str(round(stats_data['mean'], 2)),str(round(stats_data['std'], 2)),str(round(stats_data['median'], 2)),str(round(stats_data['min'], 2)),str(round(stats_data['max'], 2)),str(round(percentile_data[90], 2)),str(round(percentile_data[95], 2)),str(round(percentile_data[99], 2))])
           FH_IMP.write(csv_data + '\n')
       self.important_stats_files.append(imp_metric_stats_csv)
 
-
-  def graph(self, graphing_library='matplotlib'):
-    self.plot_timeseries(graphing_library)
-    self.plot_cdf(graphing_library)
-    print 'JOY', self.plot_files
-    return True
-
   def plot_timeseries(self, graphing_library='matplotlib'):
     if graphing_library != 'matplotlib':
-     return Metric.graph(self, graphing_library)
+     return Metric.plot_timeseries(self, graphing_library)
     else:
       logger.info('Using graphing_library {lib} for metric {name}'.format(lib=graphing_library, name=self.label))
       plot_data = {}
